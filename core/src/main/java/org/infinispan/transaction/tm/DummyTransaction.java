@@ -105,16 +105,11 @@ public class DummyTransaction implements Transaction {
    @Override
    public void rollback() throws IllegalStateException, SystemException {
       try {
-         status = Status.STATUS_ROLLING_BACK;
          runRollback();
-         status = Status.STATUS_ROLLEDBACK;
-         notifyAfterCompletion(Status.STATUS_ROLLEDBACK);
       } catch (Throwable t) {
          log.errorRollingBack(t);
          throw new IllegalStateException(t);
       }
-      // Disassociate tx from thread.
-      tm_.setTransaction(null);
    }
 
    /**
@@ -295,14 +290,22 @@ public class DummyTransaction implements Transaction {
    }
 
    public void runRollback() {
-      DummyTransaction transaction = tm_.getTransaction();
-      Collection<XAResource> resources = transaction.getEnlistedResources();
-      for (XAResource res : resources) {
-         try {
-            res.rollback(xid);
-         } catch (XAException e) {
-            log.errorRollingBack(e);
+      try {
+         status = Status.STATUS_ROLLING_BACK;
+         DummyTransaction transaction = tm_.getTransaction();
+         Collection<XAResource> resources = transaction.getEnlistedResources();
+         for (XAResource res : resources) {
+            try {
+               res.rollback(xid);
+            } catch (XAException e) {
+               log.errorRollingBack(e);
+            }
          }
+         status = Status.STATUS_ROLLEDBACK;
+      } finally {
+         notifyAfterCompletion(status);
+         // Disassociate tx from thread.
+         tm_.setTransaction(null);
       }
    }
 
