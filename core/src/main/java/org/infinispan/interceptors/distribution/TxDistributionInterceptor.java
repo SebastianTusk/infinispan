@@ -19,6 +19,10 @@
 
 package org.infinispan.interceptors.distribution;
 
+import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.TimeoutException;
+
 import org.infinispan.commands.FlagAffectedCommand;
 import org.infinispan.commands.control.LockControlCommand;
 import org.infinispan.commands.read.GetKeyValueCommand;
@@ -35,11 +39,8 @@ import org.infinispan.context.InvocationContext;
 import org.infinispan.context.impl.LocalTxInvocationContext;
 import org.infinispan.context.impl.TxInvocationContext;
 import org.infinispan.distribution.DataLocality;
-import org.infinispan.distribution.L1Manager;
 import org.infinispan.distribution.ch.ConsistentHash;
-import org.infinispan.factories.annotations.Inject;
 import org.infinispan.factories.annotations.Start;
-import org.infinispan.remoting.responses.Response;
 import org.infinispan.remoting.transport.Address;
 import org.infinispan.remoting.transport.jgroups.SuspectException;
 import org.infinispan.transaction.LocalTransaction;
@@ -47,12 +48,6 @@ import org.infinispan.transaction.LockingMode;
 import org.infinispan.util.InfinispanCollections;
 import org.infinispan.util.logging.Log;
 import org.infinispan.util.logging.LogFactory;
-
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeoutException;
 
 /**
  * Handles the distribution of the transactional caches.
@@ -67,7 +62,6 @@ public class TxDistributionInterceptor extends BaseDistributionInterceptor {
    private boolean isPessimisticCache;
    private boolean useClusteredWriteSkewCheck;
 
-   private L1Manager l1Manager;
    private boolean needReliableReturnValues;
    private boolean isL1CacheEnabled;
 
@@ -83,11 +77,6 @@ public class TxDistributionInterceptor extends BaseDistributionInterceptor {
       }
    };
 
-   @Inject
-   public void init (L1Manager l1Manager) {
-      this.l1Manager = l1Manager;
-   }
-
    @Start
    public void start() {
       isPessimisticCache = cacheConfiguration.transaction().lockingMode() == LockingMode.PESSIMISTIC;
@@ -101,9 +90,6 @@ public class TxDistributionInterceptor extends BaseDistributionInterceptor {
    public Object visitPutKeyValueCommand(InvocationContext ctx, PutKeyValueCommand command) throws Throwable {
       SingleKeyRecipientGenerator skrg = new SingleKeyRecipientGenerator(command.getKey());
       Object returnValue = handleWriteCommand(ctx, command, skrg, command.hasFlag(Flag.PUT_FOR_STATE_TRANSFER), false);
-      // If this was a remote put record that which sent it
-      if (isL1CacheEnabled && !ctx.isOriginLocal() && !skrg.generateRecipients().contains(ctx.getOrigin()))
-         l1Manager.addRequestor(command.getKey(), ctx.getOrigin());
       
       if (!ctx.isInTxScope() && command.hasFlag(Flag.PUT_FOR_EXTERNAL_READ) && !isSingleOwnerAndLocal(skrg)) {
          // putForExternalRead needs to inform owner
@@ -128,9 +114,6 @@ public class TxDistributionInterceptor extends BaseDistributionInterceptor {
    public Object visitGetKeyValueCommand(InvocationContext ctx, GetKeyValueCommand command) throws Throwable {
       try {
          Object returnValue = invokeNextInterceptor(ctx, command);
-         // If L1 caching is enabled, this is a remote command, and we found a value in our cache
-         // we store it so that we can later invalidate it
-         if (returnValue != null && isL1CacheEnabled && !ctx.isOriginLocal()) l1Manager.addRequestor(command.getKey(), ctx.getOrigin());
 
          // need to check in the context as well since a null retval is not necessarily an indication of the entry not being
          // available.  It could just have been removed in the same tx beforehand.  Also don't bother with a remote get if
@@ -169,29 +152,9 @@ public class TxDistributionInterceptor extends BaseDistributionInterceptor {
    @Override
    public Object visitCommitCommand(TxInvocationContext ctx, CommitCommand command) throws Throwable {
       if (shouldInvokeRemoteTxCommand(ctx)) {
-         Future<?> f = flushL1Caches(ctx);
          sendCommitCommand(ctx, command);
-         blockOnL1FutureIfNeeded(f);
-
-      } else if (isL1CacheEnabled && !ctx.isOriginLocal() && !ctx.getLockedKeys().isEmpty()) {
-         // We fall into this block if we are a remote node, happen to be the primary data owner and have locked keys.
-         // it is still our responsibility to invalidate L1 caches in the cluster.
-         blockOnL1FutureIfNeeded(flushL1Caches(ctx));
       }
       return invokeNextInterceptor(ctx, command);
-   }
-
-   private void blockOnL1FutureIfNeeded(Future<?> f) {
-      if (f != null && cacheConfiguration.transaction().syncCommitPhase()) {
-         try {
-            f.get();
-         } catch (Exception e) {
-            // Ignore SuspectExceptions - if the node has gone away then there is nothing to invalidate anyway.
-            if (!(e.getCause() instanceof SuspectException)) {
-               getLog().failedInvalidatingRemoteCache(e);
-            }
-         }
-      }
    }
 
    @Override
@@ -199,17 +162,12 @@ public class TxDistributionInterceptor extends BaseDistributionInterceptor {
       Object retVal = invokeNextInterceptor(ctx, command);
 
       if (shouldInvokeRemoteTxCommand(ctx)) {
-         if (command.isOnePhaseCommit()) flushL1Caches(ctx); // if we are one-phase, don't block on this future.
 
          boolean affectsAllNodes = ctx.getCacheTransaction().hasModification(ClearCommand.class);
          Collection<Address> recipients = affectsAllNodes ? dm.getWriteConsistentHash().getMembers() : dm.getAffectedNodes(ctx.getAffectedKeys());
          prepareOnAffectedNodes(ctx, command, recipients, defaultSynchronous);
 
          ((LocalTxInvocationContext) ctx).remoteLocksAcquired(recipients);
-      } else if (isL1CacheEnabled && command.isOnePhaseCommit() && !ctx.isOriginLocal() && !ctx.getLockedKeys().isEmpty()) {
-         // We fall into this block if we are a remote node, happen to be the primary data owner and have locked keys.
-         // it is still our responsibility to invalidate L1 caches in the cluster.
-         flushL1Caches(ctx);
       }
       return retVal;
    }
@@ -370,10 +328,5 @@ public class TxDistributionInterceptor extends BaseDistributionInterceptor {
    private boolean isNeedReliableReturnValues(FlagAffectedCommand command) {
       return !command.hasFlag(Flag.SKIP_REMOTE_LOOKUP)
             && !command.hasFlag(Flag.IGNORE_RETURN_VALUES) && needReliableReturnValues;
-   }
-
-   protected Future<?> flushL1Caches(InvocationContext ctx) {
-      // TODO how do we tell the L1 manager which keys are removed and which keys may still exist in remote L1?
-      return isL1CacheEnabled ? l1Manager.flushCacheWithSimpleFuture(ctx.getLockedKeys(), null, ctx.getOrigin(), true) : null;
    }
 }

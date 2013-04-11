@@ -34,6 +34,7 @@ import org.infinispan.factories.annotations.DefaultFactoryFor;
 import org.infinispan.interceptors.*;
 import org.infinispan.interceptors.base.CommandInterceptor;
 import org.infinispan.interceptors.distribution.L1NonTxInterceptor;
+import org.infinispan.interceptors.distribution.L1TxInterceptor;
 import org.infinispan.interceptors.distribution.NonTxConcurrentDistributionInterceptor;
 import org.infinispan.interceptors.distribution.NonTxDistributionInterceptor;
 import org.infinispan.interceptors.distribution.TxDistributionInterceptor;
@@ -199,8 +200,12 @@ public class InterceptorChainFactory extends AbstractNamedCacheComponentFactory 
          interceptorChain.appendInterceptor(createInterceptor(new DeadlockDetectingInterceptor(), DeadlockDetectingInterceptor.class), false);
       }
 
-      if (configuration.clustering().l1().enabled() && !configuration.transaction().transactionMode().isTransactional()) {
-         interceptorChain.appendInterceptor(createInterceptor(new L1NonTxInterceptor(), L1NonTxInterceptor.class), false);
+      if (configuration.clustering().l1().enabled()) {
+         if (!configuration.transaction().transactionMode().isTransactional()) {
+            interceptorChain.appendInterceptor(createInterceptor(new L1NonTxInterceptor(), L1NonTxInterceptor.class), false);
+         }else{
+            interceptorChain.appendInterceptor(createInterceptor(new L1TxInterceptor(), L1TxInterceptor.class), false);
+         }
       }
 
       switch (configuration.clustering().cacheMode()) {
